@@ -6,13 +6,13 @@ from selfdrive.version import comma_remote, tested_branch
 from selfdrive.car.fingerprints import eliminate_incompatible_cars, all_known_cars
 from selfdrive.car.vin import get_vin, VIN_UNKNOWN
 from selfdrive.car.fw_versions import get_fw_versions, match_fw_to_car
+from selfdrive.car.subaru.values import SUBARU_WMI
 from selfdrive.swaglog import cloudlog
 import cereal.messaging as messaging
 from selfdrive.car import gen_empty_fingerprint
 
-from cereal import car, log
+from cereal import car
 EventName = car.CarEvent.EventName
-HwType = log.HealthData.HwType
 
 
 def get_startup_event(car_recognized, controller_available):
@@ -26,6 +26,13 @@ def get_startup_event(car_recognized, controller_available):
   elif car_recognized and not controller_available:
     event = EventName.startupNoControl
   return event
+
+
+def get_one_can(logcan):
+  while True:
+    can = messaging.recv_one_retry(logcan)
+    if len(can.can) > 0:
+      return can
 
 
 def load_interfaces(brand_names):
@@ -76,11 +83,11 @@ def only_toyota_left(candidate_cars):
 
 
 # **** for use live only ****
-def fingerprint(logcan, sendcan, has_relay):
+def fingerprint(logcan, sendcan):
   fixed_fingerprint = os.environ.get('FINGERPRINT', "")
   skip_fw_query = os.environ.get('SKIP_FW_QUERY', False)
 
-  if has_relay and not fixed_fingerprint and not skip_fw_query:
+  if not fixed_fingerprint and not skip_fw_query:
     # Vin query only reliably works thorugh OBDII
     bus = 1
 
@@ -97,9 +104,12 @@ def fingerprint(logcan, sendcan, has_relay):
     else:
       cloudlog.warning("Getting VIN & FW versions")
       _, vin = get_vin(logcan, sendcan, bus)
-      cloudlog.warning("Waiting 10 seconds")
-      # Subaru needs 10sec delay before FW queries
-      time.sleep(10)
+
+      for wmi in SUBARU_WMI:
+        if vin.startswith(wmi):
+          cloudlog.warning("Subaru 10 second ECU init delay")
+          time.sleep(10)
+          break
       car_fw = get_fw_versions(logcan, sendcan, bus)
 
     fw_candidates = match_fw_to_car(car_fw)
@@ -118,7 +128,7 @@ def fingerprint(logcan, sendcan, has_relay):
   done = False
 
   while not done:
-    a = messaging.get_one_can(logcan)
+    a = get_one_can(logcan)
 
     for can in a.can:
       # need to independently try to fingerprint both bus 0 and 1 to work
@@ -139,8 +149,7 @@ def fingerprint(logcan, sendcan, has_relay):
       # Toyota needs higher time to fingerprint, since DSU does not broadcast immediately
       if only_toyota_left(candidate_cars[b]):
         frame_fingerprint = 100  # 1s
-      if len(candidate_cars[b]) == 1:
-        if frame > frame_fingerprint:
+      if len(candidate_cars[b]) == 1 and frame > frame_fingerprint:
           # fingerprint done
           car_fingerprint = candidate_cars[b][0]
 
@@ -166,15 +175,15 @@ def fingerprint(logcan, sendcan, has_relay):
   return car_fingerprint, finger, vin, car_fw, source
 
 
-def get_car(logcan, sendcan, has_relay=False):
-  candidate, fingerprints, vin, car_fw, source = fingerprint(logcan, sendcan, has_relay)
+def get_car(logcan, sendcan):
+  candidate, fingerprints, vin, car_fw, source = fingerprint(logcan, sendcan)
 
   if candidate is None:
     cloudlog.warning("car doesn't match any fingerprints: %r", fingerprints)
     candidate = "mock"
 
   CarInterface, CarController, CarState = interfaces[candidate]
-  car_params = CarInterface.get_params(candidate, fingerprints, has_relay, car_fw)
+  car_params = CarInterface.get_params(candidate, fingerprints, car_fw)
   car_params.carVin = vin
   car_params.carFw = car_fw
   car_params.fingerprintSource = source

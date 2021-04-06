@@ -1,43 +1,56 @@
 #pragma once
-#include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <stddef.h>
+#include <map>
+#include <string>
+#include <sstream>
 
 #define ERR_NO_VALUE -33
 
-int write_db_value(const char* key, const char* value, size_t value_size, bool persistent_param = false);
+class Params {
+private:
+  std::string params_path;
 
-// Reads a value from the params database.
-// Inputs:
-//  key: The key to read.
-//  value: A pointer where a newly allocated string containing the db value will
-//         be written.
-//  value_sz: A pointer where the size of value will be written. Does not
-//            include the NULL terminator.
-//  persistent_param: Boolean indicating if the param store in the /persist partition is to be used.
-//                    e.g. for sensor calibration files. Will not be cleared after wipe or re-install.
-//
-// Returns: Negative on failure, otherwise 0.
-int read_db_value(const char* key, char** value, size_t* value_sz, bool persistent_param = false);
+public:
+  Params(bool persistent_param = false);
+  Params(const std::string &path);
 
-// Delete a value from the params database.
-// Inputs are the same as read_db_value, without value and value_sz.
-int delete_db_value(const char* key, bool persistent_param = false);
+  // Delete a value
+  int remove(const char *key);
+  inline int remove(const std::string &key) {
+    return remove (key.c_str());
+  }
 
-// Reads a value from the params database, blocking until successful.
-// Inputs are the same as read_db_value.
-void read_db_value_blocking(const char* key, char** value, size_t* value_sz, bool persistent_param = false);
+  // read all values
+  int read_db_all(std::map<std::string, std::string> *params);
 
-#ifdef __cplusplus
-}  // extern "C"
-#endif
+  // read a value
+  std::string get(const char *key, bool block = false);
 
-#ifdef __cplusplus
-#include <map>
-#include <string>
-#include <vector>
-int read_db_all(std::map<std::string, std::string> *params, bool persistent_param = false);
-std::vector<char> read_db_bytes(const char* param_name, bool persistent_param = false);
-#endif
+  inline std::string get(const std::string &key, bool block = false) {
+    return get(key.c_str(), block);
+  }
+
+  template <class T>
+  std::optional<T> get(const char *key, bool block = false) {
+    std::istringstream iss(get(key, block));
+    T value{};
+    iss >> value;
+    return iss.fail() ? std::nullopt : std::optional(value);
+  }
+
+  inline bool getBool(const char *key) {
+    return get(key) == "1";
+  }
+
+  // write a value
+  int put(const char* key, const char* val, size_t value_size);
+
+  inline int put(const std::string &key, const std::string &val) {
+    return put(key.c_str(), val.data(), val.size());
+  }
+
+  inline int putBool(const char *key, bool val) {
+    return put(key, val ? "1" : "0", 1);
+  }
+};

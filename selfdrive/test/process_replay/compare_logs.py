@@ -3,8 +3,6 @@ import bz2
 import os
 import sys
 import numbers
-import capnp
-
 import dictdiffer
 
 if "CI" in os.environ:
@@ -18,11 +16,11 @@ from tools.lib.logreader import LogReader
 EPSILON = sys.float_info.epsilon
 
 
-def save_log(dest, log_msgs):
-  dat = b""
-  for msg in tqdm(log_msgs):
-    dat += msg.as_builder().to_bytes()
-  dat = bz2.compress(dat)
+def save_log(dest, log_msgs, compress=True):
+  dat = b"".join([msg.as_builder().to_bytes() for msg in tqdm(log_msgs)])
+
+  if compress:
+    dat = bz2.compress(dat)
 
   with open(dest, "wb") as f:
    f.write(dat)
@@ -33,7 +31,7 @@ def remove_ignored_fields(msg, ignore):
   for key in ignore:
     attr = msg
     keys = key.split(".")
-    if msg.which() not in key and len(keys) > 1:
+    if msg.which() != keys[0] and len(keys) > 1:
       continue
 
     for k in keys[:-1]:
@@ -47,8 +45,6 @@ def remove_ignored_fields(msg, ignore):
         val = False
       elif isinstance(v, numbers.Number):
         val = 0
-      elif isinstance(v, capnp.lib.capnp._DynamicEnum):
-        val = 0
       else:
         raise NotImplementedError
       setattr(attr, keys[-1], val)
@@ -58,11 +54,13 @@ def remove_ignored_fields(msg, ignore):
 def compare_logs(log1, log2, ignore_fields=None, ignore_msgs=None, tolerance=None):
   if ignore_fields is None:
     ignore_fields = []
-
   if ignore_msgs is None:
     ignore_msgs = []
+
   log1, log2 = [list(filter(lambda m: m.which() not in ignore_msgs, log)) for log in (log1, log2)]
-  assert len(log1) == len(log2), "logs are not same length: " + str(len(log1)) + " VS " + str(len(log2))
+
+  if len(log1) != len(log2):
+    raise Exception(f"logs are not same length: {len(log1)} VS {len(log2)}")
 
   diff = []
   for msg1, msg2 in tqdm(zip(log1, log2)):
@@ -80,11 +78,12 @@ def compare_logs(log1, log2, ignore_fields=None, ignore_msgs=None, tolerance=Non
       tolerance = EPSILON if tolerance is None else tolerance
       dd = dictdiffer.diff(msg1_dict, msg2_dict, ignore=ignore_fields)
 
-      # Dictiffer only supports relative tolerance, we also want to check for absolute
+      # Dictdiffer only supports relative tolerance, we also want to check for absolute
       def outside_tolerance(diff):
-        a, b = diff[2]
-        if isinstance(a, numbers.Number) and isinstance(b, numbers.Number):
-          return abs(a - b) > max(tolerance, tolerance * max(abs(a), abs(b)))
+        if diff[0] == "change":
+          a, b = diff[2]
+          if isinstance(a, numbers.Number) and isinstance(b, numbers.Number):
+            return abs(a - b) > max(tolerance, tolerance * max(abs(a), abs(b)))
         return True
 
       dd = list(filter(outside_tolerance, dd))

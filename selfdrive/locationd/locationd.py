@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+import json
 import numpy as np
 import sympy as sp
-
 import cereal.messaging as messaging
+from cereal import log
+from common.params import Params
 import common.transformations.coordinates as coord
 from common.transformations.orientation import ecef_euler_from_ned, \
                                                euler_from_quat, \
@@ -20,9 +22,12 @@ from selfdrive.swaglog import cloudlog
 from sympy.utilities.lambdify import lambdify
 from rednose.helpers.sympy_helpers import euler_rotate
 
+SensorSource = log.SensorEventData.SensorSource
+
 
 VISION_DECIMATION = 2
 SENSOR_DECIMATION = 10
+POSENET_STD_HIST = 40
 
 
 def to_float(arr):
@@ -52,25 +57,27 @@ class Localizer():
 
     self.kf = LiveKalman(GENERATED_DIR)
     self.reset_kalman()
-    self.max_age = .2  # seconds
+    self.max_age = .1  # seconds
     self.disabled_logs = disabled_logs
     self.calib = np.zeros(3)
     self.device_from_calib = np.eye(3)
     self.calib_from_device = np.eye(3)
-    self.calibrated = 0
+    self.calibrated = False
     self.H = get_H()
 
     self.posenet_invalid_count = 0
     self.posenet_speed = 0
     self.car_speed = 0
+    self.posenet_stds = 10*np.ones((POSENET_STD_HIST))
 
     self.converter = coord.LocalCoord.from_ecef(self.kf.x[States.ECEF_POS])
 
     self.unix_timestamp_millis = 0
     self.last_gps_fix = 0
+    self.device_fell = False
 
   @staticmethod
-  def msg_from_state(converter, calib_from_device, H, predicted_state, predicted_cov):
+  def msg_from_state(converter, calib_from_device, H, predicted_state, predicted_cov, calibrated):
     predicted_std = np.sqrt(np.diagonal(predicted_cov))
 
     fix_ecef = predicted_state[States.ECEF_POS]
@@ -112,57 +119,42 @@ class Localizer():
     #ned_vel_std = self.converter.ecef2ned(fix_ecef + vel_ecef + vel_ecef_std) - self.converter.ecef2ned(fix_ecef + vel_ecef)
 
     fix = messaging.log.LiveLocationKalman.new_message()
-    fix.positionGeodetic.value = to_float(fix_pos_geo)
-    #fix.positionGeodetic.std = to_float(fix_pos_geo_std)
-    #fix.positionGeodetic.valid = True
-    fix.positionECEF.value = to_float(fix_ecef)
-    fix.positionECEF.std = to_float(fix_ecef_std)
-    fix.positionECEF.valid = True
-    fix.velocityECEF.value = to_float(vel_ecef)
-    fix.velocityECEF.std = to_float(vel_ecef_std)
-    fix.velocityECEF.valid = True
-    fix.velocityNED.value = to_float(ned_vel)
-    #fix.velocityNED.std = to_float(ned_vel_std)
-    #fix.velocityNED.valid = True
-    fix.velocityDevice.value = to_float(vel_device)
-    fix.velocityDevice.std = to_float(vel_device_std)
-    fix.velocityDevice.valid = True
-    fix.accelerationDevice.value = to_float(predicted_state[States.ACCELERATION])
-    fix.accelerationDevice.std = to_float(predicted_std[States.ACCELERATION_ERR])
-    fix.accelerationDevice.valid = True
 
-    fix.orientationECEF.value = to_float(orientation_ecef)
-    fix.orientationECEF.std = to_float(orientation_ecef_std)
-    fix.orientationECEF.valid = True
-    fix.calibratedOrientationECEF.value = to_float(calibrated_orientation_ecef)
-    #fix.calibratedOrientationECEF.std = to_float(calibrated_orientation_ecef_std)
-    #fix.calibratedOrientationECEF.valid = True
-    fix.orientationNED.value = to_float(orientation_ned)
-    #fix.orientationNED.std = to_float(orientation_ned_std)
-    #fix.orientationNED.valid = True
-    fix.angularVelocityDevice.value = to_float(predicted_state[States.ANGULAR_VELOCITY])
-    fix.angularVelocityDevice.std = to_float(predicted_std[States.ANGULAR_VELOCITY_ERR])
-    fix.angularVelocityDevice.valid = True
+    # write measurements to msg
+    measurements = [
+      # measurement field, value, std, valid
+      (fix.positionGeodetic, fix_pos_geo, np.nan*np.zeros(3), True),
+      (fix.positionECEF, fix_ecef, fix_ecef_std, True),
+      (fix.velocityECEF, vel_ecef, vel_ecef_std, True),
+      (fix.velocityNED, ned_vel, np.nan*np.zeros(3), True),
+      (fix.velocityDevice, vel_device, vel_device_std, True),
+      (fix.accelerationDevice, predicted_state[States.ACCELERATION], predicted_std[States.ACCELERATION_ERR], True),
+      (fix.orientationECEF, orientation_ecef, orientation_ecef_std, True),
+      (fix.calibratedOrientationECEF, calibrated_orientation_ecef, np.nan*np.zeros(3), calibrated),
+      (fix.orientationNED, orientation_ned, np.nan*np.zeros(3), True),
+      (fix.angularVelocityDevice, predicted_state[States.ANGULAR_VELOCITY], predicted_std[States.ANGULAR_VELOCITY_ERR], True),
+      (fix.velocityCalibrated, vel_calib, vel_calib_std, calibrated),
+      (fix.angularVelocityCalibrated, ang_vel_calib, ang_vel_calib_std, calibrated),
+      (fix.accelerationCalibrated, acc_calib, acc_calib_std, calibrated),
+    ]
 
-    fix.velocityCalibrated.value = to_float(vel_calib)
-    fix.velocityCalibrated.std = to_float(vel_calib_std)
-    fix.velocityCalibrated.valid = True
-    fix.angularVelocityCalibrated.value = to_float(ang_vel_calib)
-    fix.angularVelocityCalibrated.std = to_float(ang_vel_calib_std)
-    fix.angularVelocityCalibrated.valid = True
-    fix.accelerationCalibrated.value = to_float(acc_calib)
-    fix.accelerationCalibrated.std = to_float(acc_calib_std)
-    fix.accelerationCalibrated.valid = True
+    for field, value, std, valid in measurements:
+      # TODO: can we write the lists faster?
+      field.value = to_float(value)
+      field.std = to_float(std)
+      field.valid = valid
+
     return fix
 
-  def liveLocationMsg(self, time):
-    fix = self.msg_from_state(self.converter, self.calib_from_device, self.H, self.kf.x, self.kf.P)
+  def liveLocationMsg(self):
+    fix = self.msg_from_state(self.converter, self.calib_from_device, self.H, self.kf.x, self.kf.P, self.calibrated)
+    # experimentally found these values, no false positives in 20k minutes of driving
+    old_mean, new_mean = np.mean(self.posenet_stds[:POSENET_STD_HIST//2]), np.mean(self.posenet_stds[POSENET_STD_HIST//2:])
+    std_spike = new_mean/old_mean > 4 and new_mean > 7
 
-    if abs(self.posenet_speed - self.car_speed) > max(0.4 * self.car_speed, 5.0):
-      self.posenet_invalid_count += 1
-    else:
-      self.posenet_invalid_count = 0
-    fix.posenetOK = self.posenet_invalid_count < 4
+    fix.posenetOK = not (std_spike and self.car_speed > 5)
+    fix.deviceStable = not self.device_fell
+    self.device_fell = False
 
     #fix.gpsWeek = self.time.week
     #fix.gpsTimeOfWeek = self.time.tow
@@ -178,15 +170,10 @@ class Localizer():
 
   def update_kalman(self, time, kind, meas, R=None):
     try:
-      self.kf.predict_and_observe(time, kind, meas, R=R)
+      self.kf.predict_and_observe(time, kind, meas, R)
     except KalmanError:
       cloudlog.error("Error in predict and observe, kalman reset")
       self.reset_kalman()
-    #idx = bisect_right([x[0] for x in self.observation_buffer], time)
-    #self.observation_buffer.insert(idx, (time, kind, meas))
-    #while len(self.observation_buffer) > 0 and self.observation_buffer[-1][0] - self.observation_buffer[0][0] > self.max_age:
-    #  else:
-    #    self.observation_buffer.pop(0)
 
   def handle_gps(self, current_time, log):
     # ignore the message if the fix is invalid
@@ -209,16 +196,16 @@ class Localizer():
 
     orientation_ecef = euler_from_quat(self.kf.x[States.ECEF_ORIENTATION])
     orientation_ned = ned_euler_from_ecef(ecef_pos, orientation_ecef)
-    orientation_ned_gps = np.array([0, 0, np.radians(log.bearing)])
+    orientation_ned_gps = np.array([0, 0, np.radians(log.bearingDeg)])
     orientation_error = np.mod(orientation_ned - orientation_ned_gps - np.pi, 2*np.pi) - np.pi
+    initial_pose_ecef_quat = quat_from_euler(ecef_euler_from_ned(ecef_pos, orientation_ned_gps))
     if np.linalg.norm(ecef_vel) > 5 and np.linalg.norm(orientation_error) > 1:
       cloudlog.error("Locationd vs ubloxLocation orientation difference too large, kalman reset")
-      initial_pose_ecef_quat = quat_from_euler(ecef_euler_from_ned(ecef_pos, orientation_ned_gps))
-      self.reset_kalman(init_orient=initial_pose_ecef_quat)
+      self.reset_kalman(init_pos=ecef_pos, init_orient=initial_pose_ecef_quat)
       self.update_kalman(current_time, ObservationKind.ECEF_ORIENTATION_FROM_GPS, initial_pose_ecef_quat)
     elif gps_est_error > 50:
       cloudlog.error("Locationd vs ubloxLocation position difference too large, kalman reset")
-      self.reset_kalman()
+      self.reset_kalman(init_pos=ecef_pos, init_orient=initial_pose_ecef_quat)
 
     self.update_kalman(current_time, ObservationKind.ECEF_POS, ecef_pos, R=ecef_pos_R)
     self.update_kalman(current_time, ObservationKind.ECEF_VEL, ecef_vel, R=ecef_vel_R)
@@ -244,6 +231,8 @@ class Localizer():
       trans_device = self.device_from_calib.dot(log.trans)
       trans_device_std = self.device_from_calib.dot(log.transStd)
       self.posenet_speed = np.linalg.norm(trans_device)
+      self.posenet_stds[:-1] = self.posenet_stds[1:]
+      self.posenet_stds[-1] = trans_device_std[0]
       self.update_kalman(current_time,
                          ObservationKind.CAMERA_ODO_TRANSLATION,
                          np.concatenate([trans_device, 10*trans_device_std]))
@@ -251,19 +240,28 @@ class Localizer():
   def handle_sensors(self, current_time, log):
     # TODO does not yet account for double sensor readings in the log
     for sensor_reading in log:
+      sensor_time = 1e-9 * sensor_reading.timestamp
+      # TODO: handle messages from two IMUs at the same time
+      if sensor_reading.source == SensorSource.lsm6ds3:
+        continue
+
       # Gyro Uncalibrated
       if sensor_reading.sensor == 5 and sensor_reading.type == 16:
         self.gyro_counter += 1
         if self.gyro_counter % SENSOR_DECIMATION == 0:
           v = sensor_reading.gyroUncalibrated.v
-          self.update_kalman(current_time, ObservationKind.PHONE_GYRO, [-v[2], -v[1], -v[0]])
+          self.update_kalman(sensor_time, ObservationKind.PHONE_GYRO, [-v[2], -v[1], -v[0]])
 
       # Accelerometer
       if sensor_reading.sensor == 1 and sensor_reading.type == 1:
+        # check if device fell, estimate 10 for g
+        # 40m/s**2 is a good filter for falling detection, no false positives in 20k minutes of driving
+        self.device_fell = self.device_fell or (np.linalg.norm(np.array(sensor_reading.acceleration.v) - np.array([10, 0, 0])) > 40)
+
         self.acc_counter += 1
         if self.acc_counter % SENSOR_DECIMATION == 0:
           v = sensor_reading.acceleration.v
-          self.update_kalman(current_time, ObservationKind.PHONE_ACCEL, [-v[2], -v[1], -v[0]])
+          self.update_kalman(sensor_time, ObservationKind.PHONE_ACCEL, [-v[2], -v[1], -v[0]])
 
   def handle_live_calib(self, current_time, log):
     if len(log.rpyCalib):
@@ -272,12 +270,14 @@ class Localizer():
       self.calib_from_device = self.device_from_calib.T
       self.calibrated = log.calStatus == 1
 
-  def reset_kalman(self, current_time=None, init_orient=None):
+  def reset_kalman(self, current_time=None, init_orient=None, init_pos=None):
     self.filter_time = current_time
     init_x = LiveKalman.initial_x.copy()
     # too nonlinear to init on completely wrong
     if init_orient is not None:
       init_x[3:7] = init_orient
+    if init_pos is not None:
+      init_x[:3] = init_pos
     self.kf.init_state(init_x, covs=np.diag(LiveKalman.initial_P_diag), filter_time=current_time)
 
     self.observation_buffer = []
@@ -298,6 +298,7 @@ def locationd_thread(sm, pm, disabled_logs=None):
   if pm is None:
     pm = messaging.PubMaster(['liveLocationKalman'])
 
+  params = Params()
   localizer = Localizer(disabled_logs=disabled_logs)
 
   while True:
@@ -322,13 +323,21 @@ def locationd_thread(sm, pm, disabled_logs=None):
       msg = messaging.new_message('liveLocationKalman')
       msg.logMonoTime = t
 
-      msg.liveLocationKalman = localizer.liveLocationMsg(t * 1e-9)
+      msg.liveLocationKalman = localizer.liveLocationMsg()
       msg.liveLocationKalman.inputsOK = sm.all_alive_and_valid()
       msg.liveLocationKalman.sensorsOK = sm.alive['sensorEvents'] and sm.valid['sensorEvents']
 
       gps_age = (t / 1e9) - localizer.last_gps_fix
       msg.liveLocationKalman.gpsOK = gps_age < 1.0
       pm.send('liveLocationKalman', msg)
+
+      if sm.frame % 1200 == 0 and msg.liveLocationKalman.gpsOK:  # once a minute
+        location = {
+          'latitude': msg.liveLocationKalman.positionGeodetic.value[0],
+          'longitude': msg.liveLocationKalman.positionGeodetic.value[1],
+          'altitude': msg.liveLocationKalman.positionGeodetic.value[2],
+        }
+        params.put("LastGPSPosition", json.dumps(location))
 
 
 def main(sm=None, pm=None):
